@@ -1,0 +1,154 @@
+---
+- hosts: all
+  become: yes
+  tasks:
+    - name: Add Kubernetes apt-key
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        state: present
+        keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+        state: present
+        filename: 'kubernetes'
+
+    - name: Install kubelet and kubeadm
+      apt:
+        name: 
+          - kubelet
+          - kubeadm
+        state: present
+        update_cache: yes
+
+    - name: Configure containerd modules
+      shell: |
+        tee /etc/modules-load.d/containerd.conf <<EOF
+        overlay
+        br_netfilter
+        EOF
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Configure kernel
+      shell: |
+        tee /etc/sysctl.d/kubernetes.conf <<EOF
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        EOF
+        sysctl --system
+
+    - name: Install containerd dependencies
+      apt:
+        name: 
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Add containerd gpg key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Configure containerd
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml
+        systemctl restart containerd
+        systemctl enable containerd
+
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i 's/^\(.*swap.*\)$/#\1/' /etc/fstab
+
+- hosts: master[0]
+  become: yes
+  tasks:
+    - name: Install kubectl
+      apt:
+        name: kubectl
+        state: present
+
+    - name: Check if master is initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+
+    - name: Initialize first master
+      shell: >
+        kubeadm init
+        --control-plane-endpoint "<LOAD_BALANCER_IP>:6443"
+        --upload-certs
+        --pod-network-cidr=10.244.0.0/16
+      when: not kubeadm_init.stat.exists
+
+    - name: Create .kube directory
+      file:
+        path: /home/support/.kube
+        state: directory
+        owner: support
+        group: support
+        mode: 0755
+      when: not kubeadm_init.stat.exists
+
+    - name: Copy kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/support/.kube/config
+        remote_src: yes
+        owner: support
+        group: support
+        mode: 0644
+      when: not kubeadm_init.stat.exists
+
+    - name: Install Calico CNI
+      shell: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      become_user: support
+      when: not kubeadm_init.stat.exists
+
+    - name: Get worker join command
+      shell: kubeadm token create --print-join-command
+      register: worker_join_command
+
+    - name: Get control-plane join command
+      shell: kubeadm token create --print-join-command --certificate-key $(kubeadm init phase upload-certs --upload-certs)
+      register: control_plane_join_command
+
+    - name: Store join commands in hostvars
+      set_fact:
+        WORKER_JOIN_CMD: "{{ worker_join_command.stdout }}"
+        CONTROL_PLANE_JOIN_CMD: "{{ control_plane_join_command.stdout }}"
+
+- hosts: master[1:]
+  become: yes
+  tasks:
+    - name: Join additional master nodes
+      shell: "{{ hostvars['master0']['CONTROL_PLANE_JOIN_CMD'] }}"
+      args:
+        warn: false
+
+- hosts: workers
+  become: yes
+  tasks:
+    - name: Check if worker is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubeadm_join
+
+    - name: Join worker nodes
+      shell: "{{ hostvars['master0']['WORKER_JOIN_CMD'] }}"
+      when: not kubeadm_join.stat.exists
