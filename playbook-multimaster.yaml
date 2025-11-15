@@ -124,8 +124,12 @@
       shell: kubeadm token create --print-join-command
       register: worker_join_command
 
+    - name: save cert
+      shell: sudo kubeadm init phase upload-certs --upload-certs | tail -n -1
+      register: token
+    
     - name: Get control-plane join command
-      shell: kubeadm token create --print-join-command --certificate-key $(kubeadm init phase upload-certs --upload-certs)
+      shell: kubeadm token create --print-join-command --certificate-key "{{ token.stdout }}"
       register: control_plane_join_command
 
     - name: Store join commands in hostvars
